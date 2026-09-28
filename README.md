@@ -1,3 +1,63 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>pytorch-image-models · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>2.65x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-2.65x-2ea44f"></a>
+    <a href="https://github.com/huggingface/pytorch-image-models/commit/43d74d69291a9abd59a9ba82fac55ec5a106ae58"><img alt="base" src="https://img.shields.io/badge/upstream-43d74d69291a-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [huggingface/pytorch-image-models](https://github.com/huggingface/pytorch-image-models) at commit
+> [`43d74d69291a`](https://github.com/huggingface/pytorch-image-models/commit/43d74d69291a9abd59a9ba82fac55ec5a106ae58) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python train.py <data> --model resnet50` |
+| **Entry point** | `train.py` |
+| **Unit measured** | one training step of ResNet-50 (end to end) |
+| **Before (stock)** | 0.1834 s per unit |
+| **After (this tree, all switches default ON)** | 0.06915 s per unit |
+| **Speedup** | **2.65x** end to end, noise floor of the host 0.16% |
+| **Output** | verified against the frozen stock reference on the pinned inputs and on a held-out set the optimiser never saw |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `train.py` | argument defaults | 1.76x |
+| `train.py` | argument defaults | 1.13x |
+| `train.py` | main() -- after the model is built (new helper) + argument defaults | 1.12x |
+| `train.py` | train_one_epoch() (new helper) + argument defaults | 1.02x |
+| `train.py` | main() -- argument defaults | 1.2x |
+| `train.py` | argument defaults | 1.2x |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/pytorch-image-models-ao.git
+cd pytorch-image-models-ao
+# set up exactly as upstream documents, then:
+python train.py <data> --model resnet50
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 43d74d69291a` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 # PyTorch Image Models
 - [What's New](#whats-new)
 - [Introduction](#introduction)

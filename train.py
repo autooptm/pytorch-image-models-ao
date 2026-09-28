@@ -143,8 +143,12 @@ group.add_argument('-b', '--batch-size', type=int, default=128, metavar='N',
                    help='Input batch size for training (default: 128)')
 group.add_argument('-vb', '--validation-batch-size', type=int, default=None, metavar='N',
                    help='Validation batch size override (default: None)')
-group.add_argument('--channels-last', action='store_true', default=False,
-                   help='Use channels_last memory layout')
+opt_3 = group.add_mutually_exclusive_group()
+opt_3.add_argument('--channels-last', dest='channels_last', action='store_true',
+                                 help='Use channels_last memory layout (default: enabled)')
+opt_3.add_argument('--no-channels-last', dest='channels_last', action='store_false',
+                                 help='Use contiguous (NCHW) memory layout')
+group.set_defaults(channels_last=True)
 group.add_argument('--fuser', default='', type=str,
                    help="Select jit fuser. One of ('', 'te', 'old', 'nvfuser')")
 group.add_argument('--grad-accum-steps', type=int, default=1, metavar='N',
@@ -158,6 +162,23 @@ group.add_argument('--head-init-scale', default=None, type=float,
                    help='Head initialization scale')
 group.add_argument('--head-init-bias', default=None, type=float,
                    help='Head initialization bias value')
+opt_4 = group.add_mutually_exclusive_group()
+opt_4.add_argument('--opt-step', dest='opt_step', action='store_true',
+                                help='optimized training step '
+                                     '(default: enabled where the recipe allows it)')
+opt_4.add_argument('--no-opt-step', dest='opt_step', action='store_false',
+                                help='run every step eagerly')
+group.set_defaults(opt_step=True)
+group.add_argument('--opt-step-warmup', type=int, default=3, metavar='N',
+                   help='batches to run before the optimized step starts (default: 3)')
+
+opt_5 = group.add_mutually_exclusive_group()
+opt_5.add_argument('--opt-blocks', dest='opt_blocks', action='store_true',
+                                  help="optimize the model's repeated block classes "
+                                       "(default: enabled)")
+opt_5.add_argument('--no-opt-blocks', dest='opt_blocks', action='store_false',
+                                  help='do not optimize the repeated block classes')
+group.set_defaults(opt_blocks=True)
 group.add_argument('--torchcompile-mode', type=str, default=None,
                     help="torch.compile mode (default: None).")
 
@@ -172,10 +193,14 @@ scripting_group.add_argument('--torchcompile', nargs='?', type=str, default=None
 group = parser.add_argument_group('Device parameters')
 group.add_argument('--device', default='cuda', type=str,
                     help="Device (accelerator) to use.")
-group.add_argument('--amp', action='store_true', default=False,
-                   help='use AMP for mixed precision training')
-group.add_argument('--amp-dtype', default='float16', type=str,
-                   help='lower precision AMP dtype (default: float16)')
+opt_6 = group.add_mutually_exclusive_group()
+opt_6.add_argument('--amp', dest='amp', action='store_true',
+                       help='use AMP for mixed precision training (default: enabled)')
+opt_6.add_argument('--no-amp', dest='amp', action='store_false',
+                       help='train in full precision (float32)')
+group.set_defaults(amp=None)   # None = not given; resolved in main()
+group.add_argument('--amp-dtype', default='bfloat16', type=str,
+                   help='lower precision AMP dtype (default: bfloat16)')
 group.add_argument('--model-dtype', default=None, type=str,
                    help='Model dtype override (non-AMP) (default: float32)')
 group.add_argument('--no-ddp-bb', action='store_true', default=False,
@@ -374,8 +399,9 @@ group.add_argument('--recovery-interval', type=int, default=0, metavar='N',
                    help='how many batches to wait before writing recovery checkpoint')
 group.add_argument('--checkpoint-hist', type=int, default=10, metavar='N',
                    help='number of checkpoints to keep (default: 10)')
-group.add_argument('-j', '--workers', type=int, default=4, metavar='N',
-                   help='how many training processes to use (default: 4)')
+group.add_argument('-j', '--workers', type=int, default=None, metavar='N',
+                   help='how many data-loading processes to use '
+                        '(default: half the host CPUs per rank, 4..16)')
 persistent_workers_group = group.add_mutually_exclusive_group()
 persistent_workers_group.add_argument('--persistent-workers', dest='persistent_workers', action='store_true',
                                       help='keep data-loader workers alive between epochs when --workers > 0 (default: enabled)')
@@ -384,8 +410,13 @@ persistent_workers_group.add_argument('--no-persistent-workers', dest='persisten
 group.set_defaults(persistent_workers=True)
 group.add_argument('--save-images', action='store_true', default=False,
                    help='save images of input batches every log interval for debugging')
-group.add_argument('--pin-mem', action='store_true', default=False,
-                   help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
+opt_7 = group.add_mutually_exclusive_group()
+opt_7.add_argument('--pin-mem', dest='pin_mem', action='store_true',
+                           help='Pin CPU memory in the DataLoader '
+                                '(default: enabled)')
+opt_7.add_argument('--no-pin-mem', dest='pin_mem', action='store_false',
+                           help='Do not pin DataLoader host memory')
+group.set_defaults(pin_mem=True)
 group.add_argument('--no-prefetcher', action='store_true', default=False,
                    help='disable fast prefetcher')
 group.add_argument('--output', default='', type=str, metavar='PATH',
@@ -490,6 +521,66 @@ def _set_loader_epoch(loader, epoch: int) -> None:
         loader.sampler.set_epoch(epoch)
 
 
+def _opt_1(model, min_instances=4):
+    counts = {}
+    for module in model.modules():
+        cls = type(module)
+        if cls.__module__.startswith('torch.nn'):
+            continue
+        if not any(True for _ in module.children()):
+            continue
+        counts[cls] = counts.get(cls, 0) + 1
+
+    compiled = []
+    for cls, n in counts.items():
+        if n < min_instances or getattr(cls, '_autooptm_opt_10', False):
+            continue
+        cls.forward = torch.compile(cls.forward)
+        cls._autooptm_opt_10 = True
+        compiled.append((cls.__name__, n))
+    return compiled
+
+
+def _opt_2(step_fn, model, optimizer, input, target):
+    saved = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    saved_opt = {}
+    for param, state in optimizer.state.items():
+        buf = state.get('momentum_buffer')
+        if buf is not None:
+            saved_opt[param] = buf.detach().clone()
+    try:
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                step_fn(input, target)
+        torch.cuda.current_stream().wait_stream(side)
+
+        opt_11, opt_12 = input.clone(), target.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, capture_error_mode='thread_local'):
+            opt_13 = step_fn(opt_11, opt_12)
+    except Exception as exc:
+        _logger.warning(f'--opt-step: unavailable ({exc!r}); using the stock step.')
+        graph = None
+    finally:
+        with torch.no_grad():
+            current = model.state_dict()
+            for key, value in saved.items():
+                current[key].copy_(value)
+            for param, state in optimizer.state.items():
+                buf = state.get('momentum_buffer')
+                if buf is None:
+                    continue
+                if param in saved_opt:
+                    buf.copy_(saved_opt[param])
+                else:
+                    buf.zero_()
+    if graph is None:
+        return None
+    return graph, opt_11, opt_12, opt_13
+
+
 def main():
     utils.setup_default_logging()
     args, args_text = _parse_args()
@@ -517,12 +608,22 @@ def main():
         _logger.info(f'Training with a single process on 1 device ({args.device}).')
     assert args.rank >= 0
 
+    if args.workers is None:
+        cpus = os.cpu_count() or 8
+        args.workers = max(4, min(16, cpus // max(1, args.world_size) // 2))
+        if utils.is_primary(args):
+            _logger.info(f'Using {args.workers} data-loading workers ({cpus} host CPUs, '
+                         f'world size {args.world_size}); pass -j N to override.')
+
     model_dtype = None
     if args.model_dtype:
         assert args.model_dtype in ('float32', 'float16', 'bfloat16')
         model_dtype = getattr(torch, args.model_dtype)
         if model_dtype == torch.float16:
             _logger.warning('float16 is not recommended for training, for half precision bfloat16 is recommended.')
+
+    if args.amp is None:
+        args.amp = model_dtype is None or model_dtype == torch.float32
 
     # resolve AMP arguments based on PyTorch availability
     amp_dtype = torch.float16
@@ -1025,6 +1126,17 @@ def main():
 
     # Compile task components before DDP wrapping. This keeps DDP out of the
     # compiled graph while preserving a compiled model reference for validation.
+    if args.opt_blocks and not args.torchcompile and not args.torchscript:
+        if not has_compile:
+            _logger.warning('--opt-blocks is not supported by this torch; skipping.')
+        else:
+            blocks = _opt_1(task.get_trainable_module())
+            if utils.is_primary(args):
+                _logger.info(
+                    'Optimized repeated block classes: '
+                    + (', '.join(f'{name} x{n}' for name, n in blocks) or 'none found')
+                )
+
     if args.torchcompile:
         assert has_compile, 'A version of torch w/ torch.compile() is required for --compile, possibly a nightly.'
         if utils.is_primary(args):
@@ -1282,6 +1394,14 @@ def train_one_epoch(
     trainable_module = task.get_trainable_module()
     trainable_module.train()
 
+    opt_8 = None
+    if (getattr(args, 'opt_step', False) and device.type == 'cuda'
+            and args.grad_accum_steps == 1 and args.clip_grad is None
+            and not args.distributed and loss_scaler is None and not task.has_ema()
+            and not naflex_mode and not scheduled_batch_mode and not args.save_images
+            and not second_order):
+        opt_8 = {}
+
     accum_steps = args.grad_accum_steps
     last_accum_steps = len(loader) % accum_steps
     updates_per_epoch = (len(loader) + accum_steps - 1) // accum_steps
@@ -1318,6 +1438,14 @@ def train_one_epoch(
             if accum_steps > 1:
                 _loss /= accum_steps
             return _loss, result
+
+        def _opt_9(_input, _target):
+            optimizer.zero_grad(set_to_none=False)
+            with amp_autocast():
+                _loss = task(_input, _target)['loss']
+            _loss.backward()
+            optimizer.step()
+            return _loss
 
         def _backward(_loss):
             clip_parameters = None
@@ -1392,7 +1520,26 @@ def train_one_epoch(
             if args.distributed:
                 global_batch_size *= args.world_size
 
-            if has_no_sync and not need_update:
+            if opt_8 is not None and opt_8.get('graph') is None \
+                    and batch_idx >= args.opt_step_warmup:
+                captured = _opt_2(_opt_9, trainable_module, optimizer, input, target)
+                if captured is None:
+                    opt_8 = None
+                else:
+                    _g, _opt_15, _opt_16, _opt_17 = captured
+                    opt_8.update(graph=_g, input=_opt_15, target=_opt_16, loss=_opt_17)
+                    if utils.is_primary(args):
+                        _logger.info('Optimized step: prepared '
+                                     f'at batch {batch_idx}; using it from here.')
+
+            opt_14 = (opt_8 is not None and opt_8.get('graph') is not None
+                        and input.shape == opt_8['input'].shape)
+            if opt_14:
+                opt_8['input'].copy_(input)
+                opt_8['target'].copy_(target)
+                opt_8['graph'].replay()
+                loss = opt_8['loss']
+            elif has_no_sync and not need_update:
                 with task.no_sync():
                     loss, result = _forward()
                     _backward(loss)
@@ -1408,7 +1555,8 @@ def train_one_epoch(
             continue
 
         num_updates += 1
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=not (opt_8 is not None
+                                             and opt_8.get('graph') is not None))
         task.update_ema(step=num_updates)
 
         if args.synchronize_step:
